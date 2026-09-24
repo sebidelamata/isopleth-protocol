@@ -9,6 +9,7 @@ solc_version = "0.8.26"
 remappings = [
     "forge-std/=lib/forge-std/src/",
     "openzeppelin-contracts/=lib/openzeppelin-contracts/contracts/",
+    "chainlink/contracts/=lib/chainlink-evm/contracts/"
 ]
 
 [fuzz]

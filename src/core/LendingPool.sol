@@ -54,6 +54,7 @@ contract LendingPool is ReentrancyGuard {
 
     // ----- loan asset registry -----
     mapping(address loanAsset => bool) public loanAssetListed;
+    // this allows only one oracle adapter per loan asset, whoever initiatesc ontrols oracle, may be better to allow multiple adapters and let the market choose
     mapping(address loanAsset => address oracleAdapter) public loanAssetOracle;
 
     // ----- buckets -----
@@ -90,7 +91,13 @@ contract LendingPool is ReentrancyGuard {
     );
     event CollateralDeposited(address indexed owner, bytes32 indexed marketId, uint256 amount);
     event CollateralWithdrawn(address indexed owner, bytes32 indexed marketId, uint256 amount);
-    event Borrowed(address indexed owner, address indexed loanAsset, bytes32 indexed marketId, uint256 amount);
+    event Borrowed(
+        address indexed owner,
+        address indexed loanAsset,
+        bytes32 indexed marketId,
+        uint256 requestedAmount,
+        uint256 filledAmount
+    );
     event Repaid(
         address indexed owner,
         bytes32 indexed marketId,
@@ -229,40 +236,102 @@ contract LendingPool is ReentrancyGuard {
         emit CollateralWithdrawn(msg.sender, marketId, amount);
     }
 
+    /// @notice Default cap on how many distinct buckets a single borrow() call will walk
+    ///         before stopping. Gas grows roughly linearly with buckets actually drawn from
+    ///         (see test/integration/GasStress.t.sol: ~300k gas for one bucket vs. ~3.7M gas
+    ///         for twenty), so an uncapped walk over an increasingly fragmented bucket ladder
+    ///         is an unbounded-gas footgun. 25 buckets keeps worst-case cost well under a
+    ///         single-digit-million-gas ceiling even on L1, while comfortably covering the
+    ///         overwhelming majority of realistic borrows that fill from a handful of buckets.
+    uint256 public constant DEFAULT_MAX_BUCKETS_PER_BORROW = 25;
+
+    /// @notice Borrow `amount` of `loanAsset` against the caller's free collateral in
+    ///         `marketId`, using the default bucket cap and reverting on any shortfall.
+    ///         Equivalent to `borrow(loanAsset, marketId, amount, 0, false)`.
+    function borrow(address loanAsset, bytes32 marketId, uint256 amount)
+        external
+        nonReentrant
+        returns (uint256 borrowedAmount)
+    {
+        borrowedAmount = _borrow(msg.sender, loanAsset, marketId, amount, DEFAULT_MAX_BUCKETS_PER_BORROW, false);
+    }
+
     /// @notice Borrow `amount` of `loanAsset` against the caller's free (unallocated)
     ///         collateral in `marketId`. Walks the market's bucket ladder from the lowest
     ///         (safest, cheapest) active LTV tick upward, only drawing from buckets whose
     ///         lenders explicitly opted into this exact collateral market, until `amount` is
-    ///         filled or the ladder + free collateral are exhausted.
-    function borrow(address loanAsset, bytes32 marketId, uint256 amount) external nonReentrant {
+    ///         filled, the ladder + free collateral are exhausted, or `maxBuckets` distinct
+    ///         buckets have been drawn from.
+    /// @param maxBuckets Caps how many buckets this call will walk before stopping, bounding
+    ///        worst-case gas. Pass 0 to use `DEFAULT_MAX_BUCKETS_PER_BORROW`.
+    /// @param allowPartialFill If the requested amount can't be fully filled -- either because
+    ///        `maxBuckets` was reached or the ladder itself ran out of eligible liquidity --
+    ///        passing true fills as much as possible and returns that (smaller) amount instead
+    ///        of reverting. Passing false reverts with `InsufficientLiquidity` on any shortfall,
+    ///        matching the simple 3-arg overload's behavior. A UI can expose this directly as
+    ///        a "fill what's available" vs. "all or nothing" toggle.
+    /// @return borrowedAmount The amount actually transferred to the caller. Equals `amount`
+    ///         unless `allowPartialFill` is true and the ladder couldn't fully fill it.
+    function borrow(address loanAsset, bytes32 marketId, uint256 amount, uint256 maxBuckets, bool allowPartialFill)
+        external
+        nonReentrant
+        returns (uint256 borrowedAmount)
+    {
+        borrowedAmount = _borrow(msg.sender, loanAsset, marketId, amount, maxBuckets, allowPartialFill);
+    }
+
+    function _borrow(
+        address borrower,
+        address loanAsset,
+        bytes32 marketId,
+        uint256 amount,
+        uint256 maxBuckets,
+        bool allowPartialFill
+    ) internal returns (uint256 borrowedAmount) {
         if (amount == 0) revert ZeroAmount();
         if (!loanAssetListed[loanAsset]) revert LoanAssetNotListed();
         MarketFactory.Market memory mkt = marketFactory.getMarket(marketId);
 
+        uint256 bucketCap = maxBuckets == 0 ? DEFAULT_MAX_BUCKETS_PER_BORROW : maxBuckets;
         PriceCtx memory ctx = _loadPriceCtx(mkt.collateralToken, mkt.oracleAdapter, loanAsset);
 
         uint256 remaining = amount;
+        uint256 bucketsTouched;
         bytes32 ladderKey = keccak256(abi.encode(loanAsset, marketId));
         uint256 ltvBitmap = ltvActiveBitmap[ladderKey];
 
-        for (uint16 ltvTick = 0; ltvTick <= MAX_TICK && remaining > 0; ltvTick++) {
+        for (uint16 ltvTick = 0; ltvTick <= MAX_TICK && remaining > 0 && bucketsTouched < bucketCap; ltvTick++) {
             if ((ltvBitmap >> ltvTick) & 1 == 0) continue;
-            if (freeCollateral[msg.sender][marketId] == 0) break;
+            if (freeCollateral[borrower][marketId] == 0) break;
 
             bytes32 ltvKey = keccak256(abi.encode(loanAsset, marketId, ltvTick));
             uint256 lltvBitmap = lltvActiveBitmap[ltvKey];
 
-            for (uint16 lltvTick = ltvTick; lltvTick <= MAX_TICK && remaining > 0; lltvTick++) {
+            for (
+                uint16 lltvTick = ltvTick;
+                lltvTick <= MAX_TICK && remaining > 0 && bucketsTouched < bucketCap;
+                lltvTick++
+            ) {
                 if ((lltvBitmap >> lltvTick) & 1 == 0) continue;
 
-                remaining = _drawFromBucket(msg.sender, marketId, loanAsset, ltvTick, lltvTick, remaining, ctx);
-                if (freeCollateral[msg.sender][marketId] == 0) break;
+                uint256 before = remaining;
+                remaining = _drawFromBucket(borrower, marketId, loanAsset, ltvTick, lltvTick, remaining, ctx);
+                if (remaining != before) bucketsTouched++;
+                if (freeCollateral[borrower][marketId] == 0) break;
             }
         }
 
-        if (remaining > 0) revert InsufficientLiquidity();
-        IERC20(loanAsset).safeTransfer(msg.sender, amount);
-        emit Borrowed(msg.sender, loanAsset, marketId, amount);
+        borrowedAmount = amount - remaining;
+
+        // A shortfall is only acceptable if the caller opted into partial fills AND something
+        // was actually filled -- returning/emitting a silent zero-amount "success" would be a
+        // footgun for any caller that forgets to check the return value.
+        if (remaining > 0 && (!allowPartialFill || borrowedAmount == 0)) {
+            revert InsufficientLiquidity();
+        }
+
+        IERC20(loanAsset).safeTransfer(borrower, borrowedAmount);
+        emit Borrowed(borrower, loanAsset, marketId, amount, borrowedAmount);
     }
 
     struct PriceCtx {

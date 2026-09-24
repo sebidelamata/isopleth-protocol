@@ -2,16 +2,8 @@
 pragma solidity 0.8.26;
 
 import {IOracleAdapter} from "../interfaces/IOracleAdapter.sol";
+import {AggregatorV3Interface} from "chainlink/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol";
 
-/// @notice Minimal subset of Chainlink's AggregatorV3Interface, declared locally to avoid an
-///         external dependency on the Chainlink package for this reference implementation.
-interface IAggregatorV3 {
-    function decimals() external view returns (uint8);
-    function latestRoundData()
-        external
-        view
-        returns (uint80 roundId, int256 answer, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound);
-}
 
 /// @title ChainlinkOracleAdapter
 /// @notice Wraps a single Chainlink feed for a single collateral token, normalizing to 1e18
@@ -31,18 +23,18 @@ contract ChainlinkOracleAdapter is IOracleAdapter {
     // a little extra gas per read but keeps runtime bytecode -- and therefore codehash --
     // identical across every instance of this contract.
     address public token_;
-    IAggregatorV3 public feed;
+    AggregatorV3Interface public feed;
     uint256 public staleAfter;
-    uint8 private feedDecimals;
+    uint8 private feedDecimals; 
 
     error StalePrice(uint256 updatedAt, uint256 nowTs, uint256 staleAfter_);
     error InvalidPrice(int256 answer);
 
     constructor(address _token, address _feed, uint256 _staleAfter) {
         token_ = _token;
-        feed = IAggregatorV3(_feed);
+        feed = AggregatorV3Interface(_feed);
         staleAfter = _staleAfter;
-        feedDecimals = IAggregatorV3(_feed).decimals();
+        feedDecimals = AggregatorV3Interface(_feed).decimals();
     }
 
     function token() external view returns (address) {

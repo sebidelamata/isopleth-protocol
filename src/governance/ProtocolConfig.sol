@@ -37,6 +37,7 @@ contract ProtocolConfig is AccessControl {
     /// @notice Per loan-asset IRM params. Any address may permissionlessly initialize an
     ///         asset with conservative defaults (see LendingPool.initLoanAsset); governance
     ///         may subsequently retune the curve.
+    /// this should probably be marketID => RateModelParams
     mapping(address loanAsset => RateModelParams) public rateModelParams;
 
     struct LiquidationAuctionParams {
