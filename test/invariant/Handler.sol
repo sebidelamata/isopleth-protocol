@@ -27,6 +27,7 @@ contract Handler is Test {
     // ghost accounting, cross-checked against on-chain state by the invariant test
     uint256 public ghost_totalCollateralDeposited;
     uint256 public ghost_totalCollateralWithdrawn;
+    uint256 public ghost_totalCollateralSeized;
 
     constructor(LendingPool _pool, MockERC20 _usdc, MockERC20 _weth, bytes32 _wethMarketId, MockOracleAdapter _wethOracle) {
         pool = _pool;
@@ -122,7 +123,10 @@ contract Handler is Test {
         uint256 repayAmount = bound(repaySeed, 1e6, 1_000_000e6);
 
         vm.prank(liquidator);
-        try pool.liquidate(owner, wethMarketId, address(usdc), ltv, lltv, repayAmount) {} catch {}
+        try pool.liquidate(owner, wethMarketId, address(usdc), ltv, lltv, repayAmount) returns (uint256, uint256 seized)
+        {
+            ghost_totalCollateralSeized += seized;
+        } catch {}
     }
 
     function movePrice(uint256 priceSeed) external {
