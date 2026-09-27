@@ -79,4 +79,38 @@ contract LendingPoolInvariantTest is StdInvariant, TestBase {
             }
         }
     }
+
+    function invariant_freePlusDrawCollateralDoesNotExceedNetDeposits()
+        public
+        view
+    {
+        uint256 n = handler.actorsLength();
+
+        uint256 totalFree;
+        uint256 totalDrawCollateral;
+
+        for (uint256 i = 0; i < n; i++) {
+            address actor = handler.actors(i);
+
+            totalFree += pool.freeCollateral(actor, wethMarketId);
+
+            LendingPool.Draw[] memory draws = pool.getDraws(actor);
+
+            for (uint256 d = 0; d < draws.length; d++) {
+                if (draws[d].marketId == wethMarketId) {
+                    totalDrawCollateral += draws[d].collateralAmount;
+                }
+            }
+        }
+
+        uint256 netDeposited =
+            handler.ghost_totalCollateralDeposited()
+            - handler.ghost_totalCollateralWithdrawn();
+
+        assertLe(
+            totalFree + totalDrawCollateral,
+            netDeposited,
+            "free plus allocated collateral exceeds net deposits"
+        );
+    }
 }

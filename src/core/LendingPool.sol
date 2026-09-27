@@ -384,7 +384,11 @@ contract LendingPool is ReentrancyGuard {
         uint256 collateralReserved = Math.mulDiv(collateralNeededValue18, 10 ** ctx.collDecimals, ctx.collPrice18);
         if (collateralReserved > freeColl) collateralReserved = freeColl; // rounding guard
 
-        uint256 borrowShares = MathLib.toSharesUp(drawAmount, b.totalBorrowAssets, b.totalBorrowShares);
+        uint256 borrowShares = MathLib.toBorrowSharesUp(
+            drawAmount,
+            b.totalBorrowAssets,
+            b.totalBorrowShares
+        );
         b.totalBorrowShares += borrowShares;
         b.totalBorrowAssets += drawAmount;
 
@@ -414,28 +418,51 @@ contract LendingPool is ReentrancyGuard {
         _accrueBucket(bKey, loanAsset);
         Bucket storage b = buckets[bKey];
 
-        uint256 debtAssets = MathLib.toAssetsUp(d.borrowShares, b.totalBorrowAssets, b.totalBorrowShares);
-        actualRepay = Math.min(amount, debtAssets);
-        uint256 repayShares = MathLib.toSharesDown(actualRepay, b.totalBorrowAssets, b.totalBorrowShares);
-        if (repayShares > d.borrowShares) repayShares = d.borrowShares;
+        uint256 originalShares = d.borrowShares;
+        uint256 debtAssets = MathLib.toAssetsUp(originalShares, b.totalBorrowAssets, b.totalBorrowShares);
+        bool fullRepay = amount >= debtAssets;
+
+        uint256 repayShares;
+        if (fullRepay) {
+            // If this is the final draw in the bucket, collect the bucket's full remaining
+            // debt. This absorbs aggregate rounding dust instead of leaving assets with zero
+            // borrow shares. Otherwise, charge this draw's rounded-up share of aggregate debt.
+            actualRepay = originalShares == b.totalBorrowShares ? b.totalBorrowAssets : debtAssets;
+            repayShares = originalShares;
+        } else {
+            actualRepay = amount;
+            repayShares = MathLib.toSharesUp(actualRepay, b.totalBorrowAssets, b.totalBorrowShares);
+            if (repayShares > originalShares) repayShares = originalShares;
+            // Avoid accepting a payment that burns no debt shares.
+            if (repayShares == 0) revert ZeroAmount();
+        }
 
         b.totalBorrowShares -= repayShares;
         b.totalBorrowAssets -= actualRepay;
-
-        uint256 originalShares = d.borrowShares;
         d.borrowShares = originalShares - repayShares;
 
-        uint256 releasedCollateral =
-            d.borrowShares == 0 ? d.collateralAmount : Math.mulDiv(d.collateralAmount, repayShares, originalShares);
+        uint256 releasedCollateral = d.borrowShares == 0
+            ? d.collateralAmount
+            : Math.mulDiv(d.collateralAmount, repayShares, originalShares);
         d.collateralAmount -= releasedCollateral;
         freeCollateral[msg.sender][marketId] += releasedCollateral;
 
         if (d.borrowShares == 0) {
             _removeDraw(msg.sender, key);
         } else {
-            d.breachTimestamp = 0; // a partial repay always improves LTV since collateral is
-                // released pro-rata with debt; the draw's LTV ratio is therefore unchanged by
-                // a partial repay in this model, so if it was healthy before it stays healthy.
+            // A partial repayment must not automatically reset the Dutch-auction clock.
+            // Re-evaluate actual post-repayment health; preserve the clock while still
+            // underwater and clear it only after the draw is healthy again.
+            MarketFactory.Market memory mkt = marketFactory.getMarket(marketId);
+            PriceCtx memory ctx = _loadPriceCtx(mkt.collateralToken, mkt.oracleAdapter, loanAsset);
+            uint256 newDebt = MathLib.toAssetsUp(d.borrowShares, b.totalBorrowAssets, b.totalBorrowShares);
+            uint256 newLtv = _ltvBpsOf(d.collateralAmount, newDebt, ctx);
+            uint256 lltvBpsVal = BucketMath.toBps(lltvTick);
+            if (newLtv <= lltvBpsVal) {
+                d.breachTimestamp = 0;
+            } else if (d.breachTimestamp == 0) {
+                d.breachTimestamp = uint64(block.timestamp);
+            }
         }
 
         IERC20(loanAsset).safeTransferFrom(msg.sender, address(this), actualRepay);
@@ -478,9 +505,18 @@ contract LendingPool is ReentrancyGuard {
         ProtocolConfig.LiquidationAuctionParams memory lp = config.getLiquidationParams();
         uint256 bonusWad = LiquidationAuction.currentBonusWad(lp, block.timestamp - d.breachTimestamp);
 
-        actualRepay = Math.min(repayAmount, debtAssets);
-        uint256 repayShares = MathLib.toSharesDown(actualRepay, b.totalBorrowAssets, b.totalBorrowShares);
-        if (repayShares > d.borrowShares) repayShares = d.borrowShares;
+        uint256 originalShares = d.borrowShares;
+        bool fullRepay = repayAmount >= debtAssets;
+        uint256 repayShares;
+        if (fullRepay) {
+            actualRepay = originalShares == b.totalBorrowShares ? b.totalBorrowAssets : debtAssets;
+            repayShares = originalShares;
+        } else {
+            actualRepay = repayAmount;
+            repayShares = MathLib.toSharesUp(actualRepay, b.totalBorrowAssets, b.totalBorrowShares);
+            if (repayShares > originalShares) repayShares = originalShares;
+            if (repayShares == 0) revert ZeroAmount();
+        }
 
         uint256 repayValue18 = Math.mulDiv(actualRepay, ctx.loanPrice18, 10 ** ctx.loanDecimals);
         uint256 seizeValue18 = repayValue18 + MathLib.wadMul(repayValue18, bonusWad);
@@ -537,7 +573,9 @@ contract LendingPool is ReentrancyGuard {
         _accrueBucket(bKey, loanAsset);
         Bucket storage b = buckets[bKey];
 
-        uint256 debtAssets = MathLib.toAssetsUp(d.borrowShares, b.totalBorrowAssets, b.totalBorrowShares);
+        uint256 debtAssets = d.borrowShares == b.totalBorrowShares
+            ? b.totalBorrowAssets
+            : MathLib.toAssetsUp(d.borrowShares, b.totalBorrowAssets, b.totalBorrowShares);
         b.totalBorrowShares -= d.borrowShares;
         b.totalBorrowAssets -= debtAssets;
         b.totalSupplyAssets = b.totalSupplyAssets > debtAssets ? b.totalSupplyAssets - debtAssets : 0;

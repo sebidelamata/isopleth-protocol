@@ -11,6 +11,57 @@ library MathLib {
     uint256 internal constant VIRTUAL_SHARES = 1e6;
     uint256 internal constant VIRTUAL_ASSETS = 1;
 
+    function toBorrowSharesUp(
+        uint256 assets,
+        uint256 totalAssets,
+        uint256 totalShares
+    ) internal pure returns (uint256) {
+        if (totalShares == 0) {
+            return assets;
+        }
+
+        return Math.mulDiv(
+            assets,
+            totalShares,
+            totalAssets,
+            Math.Rounding.Ceil
+        );
+    }
+
+    function toBorrowSharesDown(
+        uint256 assets,
+        uint256 totalAssets,
+        uint256 totalShares
+    ) internal pure returns (uint256) {
+        if (totalShares == 0) {
+            return assets;
+        }
+
+        return Math.mulDiv(
+            assets,
+            totalShares,
+            totalAssets,
+            Math.Rounding.Floor
+        );
+    }
+
+    function toBorrowAssetsUp(
+        uint256 shares,
+        uint256 totalAssets,
+        uint256 totalShares
+    ) internal pure returns (uint256) {
+        if (totalShares == 0) {
+            return 0;
+        }
+
+        return Math.mulDiv(
+            shares,
+            totalAssets,
+            totalShares,
+            Math.Rounding.Ceil
+        );
+    }
+
     function toSharesDown(uint256 assets, uint256 totalAssets, uint256 totalShares)
         internal
         pure
