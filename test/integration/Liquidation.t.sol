@@ -3,6 +3,7 @@ pragma solidity 0.8.26;
 
 import {TestBase} from "../utils/TestBase.sol";
 import {LendingPool} from "../../src/core/LendingPool.sol";
+import {BucketMath} from "../../src/libraries/BucketMath.sol";
 
 contract LiquidationTest is TestBase {
     address lender = makeAddr("lender");
@@ -111,5 +112,92 @@ contract LiquidationTest is TestBase {
     function test_socializeBadDebt_revertsWhenDrawIsHealthyOrHasCollateral() public {
         vm.expectRevert(); // draw exists but is healthy / still has collateral
         pool.socializeBadDebt(borrower, wethMarketId, address(usdc), 7500, 8300);
+    }
+
+    function test_partialLiquidation_preservesRemainingDraw() public {
+        wethOracle.setPrice(2500e18);
+
+        LendingPool.Draw memory beforeDraw =
+            pool.getDraw(borrower, wethMarketId, address(usdc), 75, 83);
+
+        bytes32 bKey = BucketMath.bucketKey(
+            wethMarketId, address(usdc), 75, 83
+        );
+
+        (
+            ,
+            ,
+            uint256 borrowAssetsBefore,
+            uint256 borrowSharesBefore,
+        ) = pool.buckets(bKey);
+
+        uint256 liquidatorCollBefore = weth.balanceOf(liquidator);
+
+        vm.prank(liquidator);
+        (uint256 repaid, uint256 seized) = pool.liquidate(
+            borrower, wethMarketId, address(usdc), 7500, 8300, 1_000e6
+        );
+
+        LendingPool.Draw memory afterDraw =
+            pool.getDraw(borrower, wethMarketId, address(usdc), 75, 83);
+
+        (
+            ,
+            ,
+            uint256 borrowAssetsAfter,
+            uint256 borrowSharesAfter,
+        ) = pool.buckets(bKey);
+
+        assertGt(repaid, 0);
+        assertLe(repaid, 1_000e6);
+        assertGt(seized, 0);
+
+        assertLt(afterDraw.borrowShares, beforeDraw.borrowShares);
+        assertLt(afterDraw.collateralAmount, beforeDraw.collateralAmount);
+
+        assertEq(
+            beforeDraw.collateralAmount - afterDraw.collateralAmount,
+            seized
+        );
+
+        assertEq(
+            borrowSharesBefore - borrowSharesAfter,
+            beforeDraw.borrowShares - afterDraw.borrowShares
+        );
+
+        assertEq(borrowAssetsBefore - borrowAssetsAfter, repaid);
+
+        assertEq(
+            weth.balanceOf(liquidator) - liquidatorCollBefore,
+            seized
+        );
+    }    
+
+    function test_fullLiquidation_returnsSurplusCollateralToBorrower() public {
+        wethOracle.setPrice(2500e18);
+
+        LendingPool.Draw memory beforeDraw =
+            pool.getDraw(borrower, wethMarketId, address(usdc), 75, 83);
+
+        uint256 freeBefore = pool.freeCollateral(borrower, wethMarketId);
+
+        vm.prank(liquidator);
+        (uint256 repaid, uint256 seized) = pool.liquidate(
+            borrower, wethMarketId, address(usdc), 7500, 8300, 30_000e6
+        );
+
+        assertGt(repaid, 0);
+        assertGt(seized, 0);
+        assertLe(seized, beforeDraw.collateralAmount);
+
+        vm.expectRevert(LendingPool.NoSuchDraw.selector);
+        pool.getDraw(borrower, wethMarketId, address(usdc), 75, 83);
+
+        uint256 freeAfter = pool.freeCollateral(borrower, wethMarketId);
+
+        assertEq(
+            freeAfter,
+            freeBefore + beforeDraw.collateralAmount - seized
+        );
     }
 }

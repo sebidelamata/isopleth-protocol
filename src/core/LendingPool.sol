@@ -29,7 +29,8 @@ import {ProtocolConfig} from "../governance/ProtocolConfig.sol";
 contract LendingPool is ReentrancyGuard {
     using SafeERC20 for IERC20;
 
-    uint16 internal constant MAX_TICK = BucketMath.MAX_LLTV_BPS / BucketMath.TICK_SPACING_BPS; // 99
+    uint16 internal constant MAX_TICK =
+        BucketMath.MAX_LLTV_BPS / BucketMath.TICK_SPACING_BPS;
 
     MarketFactory public immutable marketFactory;
     ProtocolConfig public immutable config;
@@ -47,30 +48,33 @@ contract LendingPool is ReentrancyGuard {
         address loanAsset;
         uint16 ltvTick;
         uint16 lltvTick;
-        uint256 collateralAmount; // collateral token units backing this draw
-        uint256 borrowShares; // shares in the corresponding bucket
-        uint64 breachTimestamp; // 0 = healthy; else timestamp first observed underwater
+        uint256 collateralAmount;
+        uint256 borrowShares;
+        uint64 breachTimestamp;
     }
 
-    // ----- loan asset registry -----
     mapping(address loanAsset => bool) public loanAssetListed;
-    // this allows only one oracle adapter per loan asset, whoever initiatesc ontrols oracle, may be better to allow multiple adapters and let the market choose
     mapping(address loanAsset => address oracleAdapter) public loanAssetOracle;
 
-    // ----- buckets -----
     mapping(bytes32 bucketKey => Bucket) public buckets;
-    mapping(bytes32 bucketKey => mapping(address lender => uint256 shares)) public supplyShares;
+    mapping(bytes32 bucketKey => mapping(address lender => uint256 shares))
+        public supplyShares;
 
-    // active-tick bitmaps (Uniswap-v3-tick-style), bit i = tick i has any liquidity
-    mapping(bytes32 ladderKey => uint256) public ltvActiveBitmap; // ladderKey = hash(loanAsset, marketId)
-    mapping(bytes32 ltvKey => uint256) public lltvActiveBitmap; // ltvKey = hash(loanAsset, marketId, ltvTick)
+    mapping(bytes32 ladderKey => uint256) public ltvActiveBitmap;
+    mapping(bytes32 ltvKey => uint256) public lltvActiveBitmap;
 
-    // ----- borrower accounts -----
-    mapping(address owner => mapping(bytes32 marketId => uint256)) public freeCollateral;
+    mapping(address owner => mapping(bytes32 marketId => uint256))
+        public freeCollateral;
+
     mapping(address owner => Draw[]) internal _draws;
-    mapping(address owner => mapping(bytes32 drawKey => uint256 indexPlus1)) internal _drawIndex;
+    mapping(address owner => mapping(bytes32 drawKey => uint256 indexPlus1))
+        internal _drawIndex;
 
-    event LoanAssetInitialized(address indexed loanAsset, address indexed oracleAdapter);
+    event LoanAssetInitialized(
+        address indexed loanAsset,
+        address indexed oracleAdapter
+    );
+
     event Supplied(
         address indexed lender,
         bytes32 indexed marketId,
@@ -80,6 +84,7 @@ contract LendingPool is ReentrancyGuard {
         uint256 assets,
         uint256 shares
     );
+
     event Withdrawn(
         address indexed lender,
         bytes32 indexed marketId,
@@ -89,8 +94,19 @@ contract LendingPool is ReentrancyGuard {
         uint256 assets,
         uint256 shares
     );
-    event CollateralDeposited(address indexed owner, bytes32 indexed marketId, uint256 amount);
-    event CollateralWithdrawn(address indexed owner, bytes32 indexed marketId, uint256 amount);
+
+    event CollateralDeposited(
+        address indexed owner,
+        bytes32 indexed marketId,
+        uint256 amount
+    );
+
+    event CollateralWithdrawn(
+        address indexed owner,
+        bytes32 indexed marketId,
+        uint256 amount
+    );
+
     event Borrowed(
         address indexed owner,
         address indexed loanAsset,
@@ -98,6 +114,7 @@ contract LendingPool is ReentrancyGuard {
         uint256 requestedAmount,
         uint256 filledAmount
     );
+
     event Repaid(
         address indexed owner,
         bytes32 indexed marketId,
@@ -107,6 +124,7 @@ contract LendingPool is ReentrancyGuard {
         uint256 assets,
         uint256 shares
     );
+
     event Liquidated(
         address indexed owner,
         address indexed liquidator,
@@ -117,7 +135,12 @@ contract LendingPool is ReentrancyGuard {
         uint256 repaidAssets,
         uint256 seizedCollateral
     );
-    event BadDebtSocialized(address indexed owner, bytes32 indexed bucketKey, uint256 lostAssets);
+
+    event BadDebtSocialized(
+        address indexed owner,
+        bytes32 indexed bucketKey,
+        uint256 lostAssets
+    );
 
     error LoanAssetNotListed();
     error LoanAssetAlreadyListed();
@@ -138,14 +161,13 @@ contract LendingPool is ReentrancyGuard {
     //                     LOAN ASSET REGISTRY
     // ============================================================
 
-    /// @notice Permissionlessly register a loan asset for lending/borrowing. Requires a
-    ///         governance-allowlisted oracle adapter (same allowlist markets use) so debt can
-    ///         be valued consistently against collateral. Interest curve gets conservative
-    ///         defaults; only RETUNING that curve requires governance.
     function initLoanAsset(address asset, address oracleAdapter) external {
         if (loanAssetListed[asset]) revert LoanAssetAlreadyListed();
         if (!config.isAdapterAllowed(oracleAdapter)) revert AdapterNotAllowed();
-        if (IOracleAdapter(oracleAdapter).token() != asset) revert AdapterTokenMismatch();
+
+        if (IOracleAdapter(oracleAdapter).token() != asset) {
+            revert AdapterTokenMismatch();
+        }
 
         loanAssetListed[asset] = true;
         loanAssetOracle[asset] = oracleAdapter;
@@ -158,126 +180,190 @@ contract LendingPool is ReentrancyGuard {
     //                          LENDING
     // ============================================================
 
-    /// @notice Supply `amount` of `loanAsset` into the bucket for `marketId` at the caller's
-    ///         chosen max-borrow-LTV and liquidation-LTV. This is the entire risk-management
-    ///         decision in the protocol: which collateral, and how much leverage against it.
-    function supply(bytes32 marketId, address loanAsset, uint16 ltvBps, uint16 lltvBps, uint256 amount)
-        external
-        nonReentrant
-        returns (uint256 shares)
-    {
+    function supply(
+        bytes32 marketId,
+        address loanAsset,
+        uint16 ltvBps,
+        uint16 lltvBps,
+        uint256 amount
+    ) external nonReentrant returns (uint256 shares) {
         if (amount == 0) revert ZeroAmount();
         if (!loanAssetListed[loanAsset]) revert LoanAssetNotListed();
-        marketFactory.getMarket(marketId); // reverts if market doesn't exist
 
-        (uint16 ltvTick, uint16 lltvTick) = BucketMath.validateAndTick(ltvBps, lltvBps);
-        bytes32 bKey = BucketMath.bucketKey(marketId, loanAsset, ltvTick, lltvTick);
+        marketFactory.getMarket(marketId);
+
+        (uint16 ltvTick, uint16 lltvTick) =
+            BucketMath.validateAndTick(ltvBps, lltvBps);
+
+        bytes32 bKey =
+            BucketMath.bucketKey(marketId, loanAsset, ltvTick, lltvTick);
+
         _accrueBucket(bKey, loanAsset);
+
         Bucket storage b = buckets[bKey];
 
         bool wasEmpty = b.totalSupplyAssets == 0;
-        shares = MathLib.toSharesDown(amount, b.totalSupplyAssets, b.totalSupplyShares);
+
+        shares = MathLib.toSharesDown(
+            amount,
+            b.totalSupplyAssets,
+            b.totalSupplyShares
+        );
 
         b.totalSupplyAssets += amount;
         b.totalSupplyShares += shares;
         supplyShares[bKey][msg.sender] += shares;
 
-        if (wasEmpty) _activateTicks(loanAsset, marketId, ltvTick, lltvTick);
+        if (wasEmpty) {
+            _activateTicks(loanAsset, marketId, ltvTick, lltvTick);
+        }
 
-        IERC20(loanAsset).safeTransferFrom(msg.sender, address(this), amount);
-        emit Supplied(msg.sender, marketId, loanAsset, ltvTick, lltvTick, amount, shares);
+        IERC20(loanAsset).safeTransferFrom(
+            msg.sender,
+            address(this),
+            amount
+        );
+
+        emit Supplied(
+            msg.sender,
+            marketId,
+            loanAsset,
+            ltvTick,
+            lltvTick,
+            amount,
+            shares
+        );
     }
 
-    /// @notice Withdraw previously supplied liquidity from a specific bucket. Limited to the
-    ///         bucket's currently un-borrowed assets, like any pooled lending design.
-    function withdraw(bytes32 marketId, address loanAsset, uint16 ltvBps, uint16 lltvBps, uint256 shares)
-        external
-        nonReentrant
-        returns (uint256 assets)
-    {
+    function withdraw(
+        bytes32 marketId,
+        address loanAsset,
+        uint16 ltvBps,
+        uint16 lltvBps,
+        uint256 shares
+    ) external nonReentrant returns (uint256 assets) {
         if (shares == 0) revert ZeroAmount();
-        (uint16 ltvTick, uint16 lltvTick) = BucketMath.validateAndTick(ltvBps, lltvBps);
-        bytes32 bKey = BucketMath.bucketKey(marketId, loanAsset, ltvTick, lltvTick);
+
+        (uint16 ltvTick, uint16 lltvTick) =
+            BucketMath.validateAndTick(ltvBps, lltvBps);
+
+        bytes32 bKey =
+            BucketMath.bucketKey(marketId, loanAsset, ltvTick, lltvTick);
+
         _accrueBucket(bKey, loanAsset);
+
         Bucket storage b = buckets[bKey];
 
-        assets = MathLib.toAssetsDown(shares, b.totalSupplyAssets, b.totalSupplyShares);
-        if (assets > b.totalSupplyAssets - b.totalBorrowAssets) revert InsufficientLiquidity();
+        assets = MathLib.toAssetsDown(
+            shares,
+            b.totalSupplyAssets,
+            b.totalSupplyShares
+        );
+
+        if (assets > b.totalSupplyAssets - b.totalBorrowAssets) {
+            revert InsufficientLiquidity();
+        }
 
         supplyShares[bKey][msg.sender] -= shares;
         b.totalSupplyShares -= shares;
         b.totalSupplyAssets -= assets;
 
-        if (b.totalSupplyAssets == 0) _deactivateTicks(loanAsset, marketId, ltvTick, lltvTick);
+        if (b.totalSupplyAssets == 0) {
+            _deactivateTicks(loanAsset, marketId, ltvTick, lltvTick);
+        }
 
         IERC20(loanAsset).safeTransfer(msg.sender, assets);
-        emit Withdrawn(msg.sender, marketId, loanAsset, ltvTick, lltvTick, assets, shares);
+
+        emit Withdrawn(
+            msg.sender,
+            marketId,
+            loanAsset,
+            ltvTick,
+            lltvTick,
+            assets,
+            shares
+        );
     }
 
     // ============================================================
     //                     COLLATERAL / BORROW
     // ============================================================
 
-    function depositCollateral(bytes32 marketId, uint256 amount) external nonReentrant {
+    function depositCollateral(
+        bytes32 marketId,
+        uint256 amount
+    ) external nonReentrant {
         if (amount == 0) revert ZeroAmount();
-        MarketFactory.Market memory mkt = marketFactory.getMarket(marketId);
+
+        MarketFactory.Market memory mkt =
+            marketFactory.getMarket(marketId);
+
         freeCollateral[msg.sender][marketId] += amount;
-        IERC20(mkt.collateralToken).safeTransferFrom(msg.sender, address(this), amount);
+
+        IERC20(mkt.collateralToken).safeTransferFrom(
+            msg.sender,
+            address(this),
+            amount
+        );
+
         emit CollateralDeposited(msg.sender, marketId, amount);
     }
 
-    /// @notice Withdraw collateral that is not currently backing any draw in this market.
-    function withdrawCollateral(bytes32 marketId, uint256 amount) external nonReentrant {
+    function withdrawCollateral(
+        bytes32 marketId,
+        uint256 amount
+    ) external nonReentrant {
         if (amount == 0) revert ZeroAmount();
-        if (freeCollateral[msg.sender][marketId] < amount) revert InsufficientCollateral();
+
+        if (freeCollateral[msg.sender][marketId] < amount) {
+            revert InsufficientCollateral();
+        }
+
         freeCollateral[msg.sender][marketId] -= amount;
-        MarketFactory.Market memory mkt = marketFactory.getMarket(marketId);
-        IERC20(mkt.collateralToken).safeTransfer(msg.sender, amount);
+
+        MarketFactory.Market memory mkt =
+            marketFactory.getMarket(marketId);
+
+        IERC20(mkt.collateralToken).safeTransfer(
+            msg.sender,
+            amount
+        );
+
         emit CollateralWithdrawn(msg.sender, marketId, amount);
     }
 
-    /// @notice Default cap on how many distinct buckets a single borrow() call will walk
-    ///         before stopping. Gas grows roughly linearly with buckets actually drawn from
-    ///         (see test/integration/GasStress.t.sol: ~300k gas for one bucket vs. ~3.7M gas
-    ///         for twenty), so an uncapped walk over an increasingly fragmented bucket ladder
-    ///         is an unbounded-gas footgun. 25 buckets keeps worst-case cost well under a
-    ///         single-digit-million-gas ceiling even on L1, while comfortably covering the
-    ///         overwhelming majority of realistic borrows that fill from a handful of buckets.
     uint256 public constant DEFAULT_MAX_BUCKETS_PER_BORROW = 25;
 
-    /// @notice Borrow `amount` of `loanAsset` against the caller's free collateral in
-    ///         `marketId`, using the default bucket cap and reverting on any shortfall.
-    ///         Equivalent to `borrow(loanAsset, marketId, amount, 0, false)`.
-    function borrow(address loanAsset, bytes32 marketId, uint256 amount)
-        external
-        nonReentrant
-        returns (uint256 borrowedAmount)
-    {
-        borrowedAmount = _borrow(msg.sender, loanAsset, marketId, amount, DEFAULT_MAX_BUCKETS_PER_BORROW, false);
+    function borrow(
+        address loanAsset,
+        bytes32 marketId,
+        uint256 amount
+    ) external nonReentrant returns (uint256 borrowedAmount) {
+        borrowedAmount = _borrow(
+            msg.sender,
+            loanAsset,
+            marketId,
+            amount,
+            DEFAULT_MAX_BUCKETS_PER_BORROW,
+            false
+        );
     }
 
-    /// @notice Borrow `amount` of `loanAsset` against the caller's free (unallocated)
-    ///         collateral in `marketId`. Walks the market's bucket ladder from the lowest
-    ///         (safest, cheapest) active LTV tick upward, only drawing from buckets whose
-    ///         lenders explicitly opted into this exact collateral market, until `amount` is
-    ///         filled, the ladder + free collateral are exhausted, or `maxBuckets` distinct
-    ///         buckets have been drawn from.
-    /// @param maxBuckets Caps how many buckets this call will walk before stopping, bounding
-    ///        worst-case gas. Pass 0 to use `DEFAULT_MAX_BUCKETS_PER_BORROW`.
-    /// @param allowPartialFill If the requested amount can't be fully filled -- either because
-    ///        `maxBuckets` was reached or the ladder itself ran out of eligible liquidity --
-    ///        passing true fills as much as possible and returns that (smaller) amount instead
-    ///        of reverting. Passing false reverts with `InsufficientLiquidity` on any shortfall,
-    ///        matching the simple 3-arg overload's behavior. A UI can expose this directly as
-    ///        a "fill what's available" vs. "all or nothing" toggle.
-    /// @return borrowedAmount The amount actually transferred to the caller. Equals `amount`
-    ///         unless `allowPartialFill` is true and the ladder couldn't fully fill it.
-    function borrow(address loanAsset, bytes32 marketId, uint256 amount, uint256 maxBuckets, bool allowPartialFill)
-        external
-        nonReentrant
-        returns (uint256 borrowedAmount)
-    {
-        borrowedAmount = _borrow(msg.sender, loanAsset, marketId, amount, maxBuckets, allowPartialFill);
+    function borrow(
+        address loanAsset,
+        bytes32 marketId,
+        uint256 amount,
+        uint256 maxBuckets,
+        bool allowPartialFill
+    ) external nonReentrant returns (uint256 borrowedAmount) {
+        borrowedAmount = _borrow(
+            msg.sender,
+            loanAsset,
+            marketId,
+            amount,
+            maxBuckets,
+            allowPartialFill
+        );
     }
 
     function _borrow(
@@ -290,48 +376,94 @@ contract LendingPool is ReentrancyGuard {
     ) internal returns (uint256 borrowedAmount) {
         if (amount == 0) revert ZeroAmount();
         if (!loanAssetListed[loanAsset]) revert LoanAssetNotListed();
-        MarketFactory.Market memory mkt = marketFactory.getMarket(marketId);
 
-        uint256 bucketCap = maxBuckets == 0 ? DEFAULT_MAX_BUCKETS_PER_BORROW : maxBuckets;
-        PriceCtx memory ctx = _loadPriceCtx(mkt.collateralToken, mkt.oracleAdapter, loanAsset);
+        MarketFactory.Market memory mkt =
+            marketFactory.getMarket(marketId);
+
+        uint256 bucketCap = maxBuckets == 0
+            ? DEFAULT_MAX_BUCKETS_PER_BORROW
+            : maxBuckets;
+
+        PriceCtx memory ctx = _loadPriceCtx(
+            mkt.collateralToken,
+            mkt.oracleAdapter,
+            loanAsset
+        );
 
         uint256 remaining = amount;
         uint256 bucketsTouched;
-        bytes32 ladderKey = keccak256(abi.encode(loanAsset, marketId));
+
+        bytes32 ladderKey =
+            keccak256(abi.encode(loanAsset, marketId));
+
         uint256 ltvBitmap = ltvActiveBitmap[ladderKey];
 
-        for (uint16 ltvTick = 0; ltvTick <= MAX_TICK && remaining > 0 && bucketsTouched < bucketCap; ltvTick++) {
-            if ((ltvBitmap >> ltvTick) & 1 == 0) continue;
+        for (
+            uint16 ltvTick = 0;
+            ltvTick <= MAX_TICK &&
+                remaining > 0 &&
+                bucketsTouched < bucketCap;
+            ltvTick++
+        ) {
+            if (((ltvBitmap >> ltvTick) & 1) == 0) continue;
+
             if (freeCollateral[borrower][marketId] == 0) break;
 
-            bytes32 ltvKey = keccak256(abi.encode(loanAsset, marketId, ltvTick));
+            bytes32 ltvKey =
+                keccak256(abi.encode(loanAsset, marketId, ltvTick));
+
             uint256 lltvBitmap = lltvActiveBitmap[ltvKey];
 
             for (
                 uint16 lltvTick = ltvTick;
-                lltvTick <= MAX_TICK && remaining > 0 && bucketsTouched < bucketCap;
+                lltvTick <= MAX_TICK &&
+                    remaining > 0 &&
+                    bucketsTouched < bucketCap;
                 lltvTick++
             ) {
-                if ((lltvBitmap >> lltvTick) & 1 == 0) continue;
+                if (((lltvBitmap >> lltvTick) & 1) == 0) continue;
 
-                uint256 before = remaining;
-                remaining = _drawFromBucket(borrower, marketId, loanAsset, ltvTick, lltvTick, remaining, ctx);
-                if (remaining != before) bucketsTouched++;
+                uint256 beforeRemaining = remaining;
+
+                remaining = _drawFromBucket(
+                    borrower,
+                    marketId,
+                    loanAsset,
+                    ltvTick,
+                    lltvTick,
+                    remaining,
+                    ctx
+                );
+
+                if (remaining != beforeRemaining) {
+                    bucketsTouched++;
+                }
+
                 if (freeCollateral[borrower][marketId] == 0) break;
             }
         }
 
         borrowedAmount = amount - remaining;
 
-        // A shortfall is only acceptable if the caller opted into partial fills AND something
-        // was actually filled -- returning/emitting a silent zero-amount "success" would be a
-        // footgun for any caller that forgets to check the return value.
-        if (remaining > 0 && (!allowPartialFill || borrowedAmount == 0)) {
+        if (
+            remaining > 0 &&
+            (!allowPartialFill || borrowedAmount == 0)
+        ) {
             revert InsufficientLiquidity();
         }
 
-        IERC20(loanAsset).safeTransfer(borrower, borrowedAmount);
-        emit Borrowed(borrower, loanAsset, marketId, amount, borrowedAmount);
+        IERC20(loanAsset).safeTransfer(
+            borrower,
+            borrowedAmount
+        );
+
+        emit Borrowed(
+            borrower,
+            loanAsset,
+            marketId,
+            amount,
+            borrowedAmount
+        );
     }
 
     struct PriceCtx {
@@ -341,15 +473,20 @@ contract LendingPool is ReentrancyGuard {
         uint8 loanDecimals;
     }
 
-    function _loadPriceCtx(address collateralToken, address oracleAdapter, address loanAsset)
-        internal
-        view
-        returns (PriceCtx memory ctx)
-    {
+    function _loadPriceCtx(
+        address collateralToken,
+        address oracleAdapter,
+        address loanAsset
+    ) internal view returns (PriceCtx memory ctx) {
         ctx.collPrice18 = IOracleAdapter(oracleAdapter).getPrice();
-        ctx.loanPrice18 = IOracleAdapter(loanAssetOracle[loanAsset]).getPrice();
-        ctx.collDecimals = IERC20Metadata(collateralToken).decimals();
-        ctx.loanDecimals = IERC20Metadata(loanAsset).decimals();
+        ctx.loanPrice18 =
+            IOracleAdapter(loanAssetOracle[loanAsset]).getPrice();
+
+        ctx.collDecimals =
+            IERC20Metadata(collateralToken).decimals();
+
+        ctx.loanDecimals =
+            IERC20Metadata(loanAsset).decimals();
     }
 
     function _drawFromBucket(
@@ -361,39 +498,92 @@ contract LendingPool is ReentrancyGuard {
         uint256 remaining,
         PriceCtx memory ctx
     ) internal returns (uint256) {
-        bytes32 bKey = BucketMath.bucketKey(marketId, loanAsset, ltvTick, lltvTick);
+        bytes32 bKey =
+            BucketMath.bucketKey(marketId, loanAsset, ltvTick, lltvTick);
+
         _accrueBucket(bKey, loanAsset);
+
         Bucket storage b = buckets[bKey];
 
-        uint256 available = b.totalSupplyAssets - b.totalBorrowAssets;
+        uint256 available =
+            b.totalSupplyAssets - b.totalBorrowAssets;
+
         if (available == 0) return remaining;
 
-        uint256 freeColl = freeCollateral[owner][marketId];
+        uint256 freeColl =
+            freeCollateral[owner][marketId];
+
         if (freeColl == 0) return remaining;
 
         uint256 ltvBpsVal = BucketMath.toBps(ltvTick);
-        uint256 collValue18 = Math.mulDiv(freeColl, ctx.collPrice18, 10 ** ctx.collDecimals);
-        uint256 maxDebtValue18 = Math.mulDiv(collValue18, ltvBpsVal, BucketMath.BPS_DENOMINATOR);
-        uint256 maxDebtLoanUnits = Math.mulDiv(maxDebtValue18, 10 ** ctx.loanDecimals, ctx.loanPrice18);
 
-        uint256 drawAmount = Math.min(available, Math.min(remaining, maxDebtLoanUnits));
+        uint256 collValue18 = Math.mulDiv(
+            freeColl,
+            ctx.collPrice18,
+            10 ** ctx.collDecimals
+        );
+
+        uint256 maxDebtValue18 = Math.mulDiv(
+            collValue18,
+            ltvBpsVal,
+            BucketMath.BPS_DENOMINATOR
+        );
+
+        uint256 maxDebtLoanUnits = Math.mulDiv(
+            maxDebtValue18,
+            10 ** ctx.loanDecimals,
+            ctx.loanPrice18
+        );
+
+        uint256 drawAmount = Math.min(
+            available,
+            Math.min(remaining, maxDebtLoanUnits)
+        );
+
         if (drawAmount == 0) return remaining;
 
-        uint256 drawValue18 = Math.mulDiv(drawAmount, ctx.loanPrice18, 10 ** ctx.loanDecimals);
-        uint256 collateralNeededValue18 = Math.mulDiv(drawValue18, BucketMath.BPS_DENOMINATOR, ltvBpsVal);
-        uint256 collateralReserved = Math.mulDiv(collateralNeededValue18, 10 ** ctx.collDecimals, ctx.collPrice18);
-        if (collateralReserved > freeColl) collateralReserved = freeColl; // rounding guard
+        uint256 drawValue18 = Math.mulDiv(
+            drawAmount,
+            ctx.loanPrice18,
+            10 ** ctx.loanDecimals
+        );
+
+        uint256 collateralNeededValue18 = Math.mulDiv(
+            drawValue18,
+            BucketMath.BPS_DENOMINATOR,
+            ltvBpsVal
+        );
+
+        uint256 collateralReserved = Math.mulDiv(
+            collateralNeededValue18,
+            10 ** ctx.collDecimals,
+            ctx.collPrice18
+        );
+
+        if (collateralReserved > freeColl) {
+            collateralReserved = freeColl;
+        }
 
         uint256 borrowShares = MathLib.toBorrowSharesUp(
             drawAmount,
             b.totalBorrowAssets,
             b.totalBorrowShares
         );
+
         b.totalBorrowShares += borrowShares;
         b.totalBorrowAssets += drawAmount;
 
         freeCollateral[owner][marketId] -= collateralReserved;
-        _addOrUpdateDraw(owner, marketId, loanAsset, ltvTick, lltvTick, collateralReserved, borrowShares);
+
+        _addOrUpdateDraw(
+            owner,
+            marketId,
+            loanAsset,
+            ltvTick,
+            lltvTick,
+            collateralReserved,
+            borrowShares
+        );
 
         return remaining - drawAmount;
     }
@@ -402,62 +592,125 @@ contract LendingPool is ReentrancyGuard {
     //                       REPAY / LIQUIDATE
     // ============================================================
 
-    function repay(bytes32 marketId, address loanAsset, uint16 ltvBps, uint16 lltvBps, uint256 amount)
-        external
-        nonReentrant
-        returns (uint256 actualRepay)
-    {
+    function repay(
+        bytes32 marketId,
+        address loanAsset,
+        uint16 ltvBps,
+        uint16 lltvBps,
+        uint256 amount
+    ) external nonReentrant returns (uint256 actualRepay) {
         if (amount == 0) revert ZeroAmount();
-        (uint16 ltvTick, uint16 lltvTick) = BucketMath.validateAndTick(ltvBps, lltvBps);
-        bytes32 key = keccak256(abi.encode(marketId, loanAsset, ltvTick, lltvTick));
+
+        (uint16 ltvTick, uint16 lltvTick) =
+            BucketMath.validateAndTick(ltvBps, lltvBps);
+
+        bytes32 key =
+            keccak256(abi.encode(marketId, loanAsset, ltvTick, lltvTick));
+
         uint256 idxPlus1 = _drawIndex[msg.sender][key];
+
         if (idxPlus1 == 0) revert NoSuchDraw();
+
         Draw storage d = _draws[msg.sender][idxPlus1 - 1];
 
-        bytes32 bKey = BucketMath.bucketKey(marketId, loanAsset, ltvTick, lltvTick);
+        bytes32 bKey =
+            BucketMath.bucketKey(marketId, loanAsset, ltvTick, lltvTick);
+
         _accrueBucket(bKey, loanAsset);
+
         Bucket storage b = buckets[bKey];
 
         uint256 originalShares = d.borrowShares;
-        uint256 debtAssets = MathLib.toAssetsUp(originalShares, b.totalBorrowAssets, b.totalBorrowShares);
-        bool fullRepay = amount >= debtAssets;
+
+        uint256 debtAssets = MathLib.toBorrowAssetsUp(
+            originalShares,
+            b.totalBorrowAssets,
+            b.totalBorrowShares
+        );
 
         uint256 repayShares;
+
+        bool fullRepay = amount >= debtAssets;
+
         if (fullRepay) {
-            // If this is the final draw in the bucket, collect the bucket's full remaining
-            // debt. This absorbs aggregate rounding dust instead of leaving assets with zero
-            // borrow shares. Otherwise, charge this draw's rounded-up share of aggregate debt.
-            actualRepay = originalShares == b.totalBorrowShares ? b.totalBorrowAssets : debtAssets;
             repayShares = originalShares;
+
+            // When burning the final bucket shares, settle the exact
+            // aggregate debt balance, not a rounded per-draw estimate.
+            actualRepay = originalShares == b.totalBorrowShares
+                ? b.totalBorrowAssets
+                : debtAssets;
         } else {
             actualRepay = amount;
-            repayShares = MathLib.toSharesUp(actualRepay, b.totalBorrowAssets, b.totalBorrowShares);
-            if (repayShares > originalShares) repayShares = originalShares;
-            // Avoid accepting a payment that burns no debt shares.
+
+            repayShares = MathLib.toBorrowSharesUp(
+                actualRepay,
+                b.totalBorrowAssets,
+                b.totalBorrowShares
+            );
+
+            if (repayShares > originalShares) {
+                repayShares = originalShares;
+            }
+
             if (repayShares == 0) revert ZeroAmount();
+
+            // A rounded partial repayment can burn all shares belonging
+            // to this draw. Settle the draw's entire rounded debt.
+            if (repayShares == originalShares) {
+                actualRepay = originalShares == b.totalBorrowShares
+                    ? b.totalBorrowAssets
+                    : debtAssets;
+            }
         }
 
         b.totalBorrowShares -= repayShares;
         b.totalBorrowAssets -= actualRepay;
+
         d.borrowShares = originalShares - repayShares;
 
-        uint256 releasedCollateral = d.borrowShares == 0
-            ? d.collateralAmount
-            : Math.mulDiv(d.collateralAmount, repayShares, originalShares);
+        uint256 releasedCollateral;
+
+        if (d.borrowShares == 0) {
+            releasedCollateral = d.collateralAmount;
+        } else {
+            releasedCollateral = Math.mulDiv(
+                d.collateralAmount,
+                repayShares,
+                originalShares
+            );
+        }
+
         d.collateralAmount -= releasedCollateral;
+
         freeCollateral[msg.sender][marketId] += releasedCollateral;
 
         if (d.borrowShares == 0) {
             _removeDraw(msg.sender, key);
         } else {
-            // A partial repayment must not automatically reset the Dutch-auction clock.
-            // Re-evaluate actual post-repayment health; preserve the clock while still
-            // underwater and clear it only after the draw is healthy again.
-            MarketFactory.Market memory mkt = marketFactory.getMarket(marketId);
-            PriceCtx memory ctx = _loadPriceCtx(mkt.collateralToken, mkt.oracleAdapter, loanAsset);
-            uint256 newDebt = MathLib.toAssetsUp(d.borrowShares, b.totalBorrowAssets, b.totalBorrowShares);
-            uint256 newLtv = _ltvBpsOf(d.collateralAmount, newDebt, ctx);
+            MarketFactory.Market memory mkt =
+                marketFactory.getMarket(marketId);
+
+            PriceCtx memory ctx = _loadPriceCtx(
+                mkt.collateralToken,
+                mkt.oracleAdapter,
+                loanAsset
+            );
+
+            uint256 newDebt = MathLib.toBorrowAssetsUp(
+                d.borrowShares,
+                b.totalBorrowAssets,
+                b.totalBorrowShares
+            );
+
+            uint256 newLtv = _ltvBpsOf(
+                d.collateralAmount,
+                newDebt,
+                ctx
+            );
+
             uint256 lltvBpsVal = BucketMath.toBps(lltvTick);
+
             if (newLtv <= lltvBpsVal) {
                 d.breachTimestamp = 0;
             } else if (d.breachTimestamp == 0) {
@@ -465,15 +718,29 @@ contract LendingPool is ReentrancyGuard {
             }
         }
 
-        IERC20(loanAsset).safeTransferFrom(msg.sender, address(this), actualRepay);
-        emit Repaid(msg.sender, marketId, loanAsset, ltvTick, lltvTick, actualRepay, repayShares);
+        // A bucket with no borrow shares must have no borrow assets.
+        assert(
+            b.totalBorrowShares != 0 ||
+            b.totalBorrowAssets == 0
+        );
+
+        IERC20(loanAsset).safeTransferFrom(
+            msg.sender,
+            address(this),
+            actualRepay
+        );
+
+        emit Repaid(
+            msg.sender,
+            marketId,
+            loanAsset,
+            ltvTick,
+            lltvTick,
+            actualRepay,
+            repayShares
+        );
     }
 
-    /// @notice Liquidate a specific underwater draw. Bonus follows the systemic Dutch-auction
-    ///         curve in ProtocolConfig -- never lender-configurable. If the draw's collateral
-    ///         is insufficient to cover the full bonus (deep bad debt), the liquidator simply
-    ///         receives whatever collateral remains; use `socializeBadDebt` afterward to
-    ///         write down the bucket's remaining debt.
     function liquidate(
         address owner,
         bytes32 marketId,
@@ -481,106 +748,238 @@ contract LendingPool is ReentrancyGuard {
         uint16 ltvBps,
         uint16 lltvBps,
         uint256 repayAmount
-    ) external nonReentrant returns (uint256 actualRepay, uint256 seizedCollateral) {
-        (uint16 ltvTick, uint16 lltvTick) = BucketMath.validateAndTick(ltvBps, lltvBps);
-        bytes32 key = keccak256(abi.encode(marketId, loanAsset, ltvTick, lltvTick));
+    ) external nonReentrant returns (
+        uint256 actualRepay,
+        uint256 seizedCollateral
+    ) {
+        (uint16 ltvTick, uint16 lltvTick) =
+            BucketMath.validateAndTick(ltvBps, lltvBps);
+
+        bytes32 key =
+            keccak256(abi.encode(marketId, loanAsset, ltvTick, lltvTick));
+
         uint256 idxPlus1 = _drawIndex[owner][key];
+
         if (idxPlus1 == 0) revert NoSuchDraw();
+
         Draw storage d = _draws[owner][idxPlus1 - 1];
 
-        bytes32 bKey = BucketMath.bucketKey(marketId, loanAsset, ltvTick, lltvTick);
+        bytes32 bKey =
+            BucketMath.bucketKey(marketId, loanAsset, ltvTick, lltvTick);
+
         _accrueBucket(bKey, loanAsset);
+
         Bucket storage b = buckets[bKey];
 
-        MarketFactory.Market memory mkt = marketFactory.getMarket(marketId);
-        PriceCtx memory ctx = _loadPriceCtx(mkt.collateralToken, mkt.oracleAdapter, loanAsset);
+        MarketFactory.Market memory mkt =
+            marketFactory.getMarket(marketId);
 
-        uint256 debtAssets = MathLib.toAssetsUp(d.borrowShares, b.totalBorrowAssets, b.totalBorrowShares);
-        uint256 currentLtvBps = _ltvBpsOf(d.collateralAmount, debtAssets, ctx);
+        PriceCtx memory ctx = _loadPriceCtx(
+            mkt.collateralToken,
+            mkt.oracleAdapter,
+            loanAsset
+        );
+
+        uint256 debtAssets = MathLib.toBorrowAssetsUp(
+            d.borrowShares,
+            b.totalBorrowAssets,
+            b.totalBorrowShares
+        );
+
+        uint256 currentLtvBps = _ltvBpsOf(
+            d.collateralAmount,
+            debtAssets,
+            ctx
+        );
+
         uint256 lltvBpsVal = BucketMath.toBps(lltvTick);
-        if (currentLtvBps <= lltvBpsVal) revert NotLiquidatable();
 
-        if (d.breachTimestamp == 0) d.breachTimestamp = uint64(block.timestamp);
-
-        ProtocolConfig.LiquidationAuctionParams memory lp = config.getLiquidationParams();
-        uint256 bonusWad = LiquidationAuction.currentBonusWad(lp, block.timestamp - d.breachTimestamp);
-
-        uint256 originalShares = d.borrowShares;
-        bool fullRepay = repayAmount >= debtAssets;
-        uint256 repayShares;
-        if (fullRepay) {
-            actualRepay = originalShares == b.totalBorrowShares ? b.totalBorrowAssets : debtAssets;
-            repayShares = originalShares;
-        } else {
-            actualRepay = repayAmount;
-            repayShares = MathLib.toSharesUp(actualRepay, b.totalBorrowAssets, b.totalBorrowShares);
-            if (repayShares > originalShares) repayShares = originalShares;
-            if (repayShares == 0) revert ZeroAmount();
+        if (currentLtvBps <= lltvBpsVal) {
+            revert NotLiquidatable();
         }
 
-        uint256 repayValue18 = Math.mulDiv(actualRepay, ctx.loanPrice18, 10 ** ctx.loanDecimals);
-        uint256 seizeValue18 = repayValue18 + MathLib.wadMul(repayValue18, bonusWad);
-        seizedCollateral = Math.mulDiv(seizeValue18, 10 ** ctx.collDecimals, ctx.collPrice18);
-        if (seizedCollateral > d.collateralAmount) seizedCollateral = d.collateralAmount; // bad-debt cap
+        if (d.breachTimestamp == 0) {
+            d.breachTimestamp = uint64(block.timestamp);
+        }
+
+        ProtocolConfig.LiquidationAuctionParams memory lp =
+            config.getLiquidationParams();
+
+        uint256 bonusWad = LiquidationAuction.currentBonusWad(
+            lp,
+            block.timestamp - d.breachTimestamp
+        );
+
+        uint256 originalShares = d.borrowShares;
+
+        bool fullRepay = repayAmount >= debtAssets;
+
+        uint256 repayShares;
+
+        if (fullRepay) {
+            repayShares = originalShares;
+
+            actualRepay = originalShares == b.totalBorrowShares
+                ? b.totalBorrowAssets
+                : debtAssets;
+        } else {
+            actualRepay = repayAmount;
+
+            repayShares = MathLib.toBorrowSharesUp(
+                actualRepay,
+                b.totalBorrowAssets,
+                b.totalBorrowShares
+            );
+
+            if (repayShares > originalShares) {
+                repayShares = originalShares;
+            }
+
+            if (repayShares == 0) revert ZeroAmount();
+
+            // Match repay(): if rounding burns all of this draw's shares,
+            // settle the full rounded debt. If these are also the final
+            // bucket shares, settle the exact aggregate asset balance.
+            if (repayShares == originalShares) {
+                actualRepay = originalShares == b.totalBorrowShares
+                    ? b.totalBorrowAssets
+                    : debtAssets;
+            }
+        }
+
+        uint256 repayValue18 = Math.mulDiv(
+            actualRepay,
+            ctx.loanPrice18,
+            10 ** ctx.loanDecimals
+        );
+
+        uint256 seizeValue18 =
+            repayValue18 + MathLib.wadMul(repayValue18, bonusWad);
+
+        seizedCollateral = Math.mulDiv(
+            seizeValue18,
+            10 ** ctx.collDecimals,
+            ctx.collPrice18
+        );
+
+        if (seizedCollateral > d.collateralAmount) {
+            seizedCollateral = d.collateralAmount;
+        }
 
         b.totalBorrowShares -= repayShares;
         b.totalBorrowAssets -= actualRepay;
+
         d.borrowShares -= repayShares;
         d.collateralAmount -= seizedCollateral;
 
         if (d.borrowShares == 0) {
-            // Fully repaid by this liquidation. Any leftover collateral belongs back to the
-            // owner as free collateral -- it must never simply be deleted along with the draw.
             if (d.collateralAmount > 0) {
                 freeCollateral[owner][marketId] += d.collateralAmount;
                 d.collateralAmount = 0;
             }
+
             _removeDraw(owner, key);
         } else if (d.collateralAmount == 0) {
-            // Bad debt: the draw has debt but nothing left to seize. It must persist (not be
-            // deleted) so `socializeBadDebt` can later write down the bucket's remaining
-            // assets -- deleting it here would silently erase the loss instead of accounting
-            // for it. breachTimestamp is left as-is (already breached).
+            // Keep the remaining debt draw alive so it can be socialized.
         } else {
-            uint256 newDebt = MathLib.toAssetsUp(d.borrowShares, b.totalBorrowAssets, b.totalBorrowShares);
-            uint256 newLtv = _ltvBpsOf(d.collateralAmount, newDebt, ctx);
-            d.breachTimestamp = newLtv <= lltvBpsVal ? 0 : d.breachTimestamp;
+            uint256 newDebt = MathLib.toBorrowAssetsUp(
+                d.borrowShares,
+                b.totalBorrowAssets,
+                b.totalBorrowShares
+            );
+
+            uint256 newLtv = _ltvBpsOf(
+                d.collateralAmount,
+                newDebt,
+                ctx
+            );
+
+            d.breachTimestamp =
+                newLtv <= lltvBpsVal ? 0 : d.breachTimestamp;
         }
 
-        IERC20(loanAsset).safeTransferFrom(msg.sender, address(this), actualRepay);
-        IERC20(mkt.collateralToken).safeTransfer(msg.sender, seizedCollateral);
+        // Match repay(): final bucket-share removal must not leave assets.
+        assert(
+            b.totalBorrowShares != 0 ||
+            b.totalBorrowAssets == 0
+        );
 
-        emit Liquidated(owner, msg.sender, marketId, loanAsset, ltvTick, lltvTick, actualRepay, seizedCollateral);
+        IERC20(loanAsset).safeTransferFrom(
+            msg.sender,
+            address(this),
+            actualRepay
+        );
+
+        IERC20(mkt.collateralToken).safeTransfer(
+            msg.sender,
+            seizedCollateral
+        );
+
+        emit Liquidated(
+            owner,
+            msg.sender,
+            marketId,
+            loanAsset,
+            ltvTick,
+            lltvTick,
+            actualRepay,
+            seizedCollateral
+        );
     }
 
-    /// @notice After a liquidation leaves a draw with debt but zero collateral, anyone may
-    ///         call this to write down the bucket's outstanding assets by the remaining debt.
-    ///         The loss is borne only by lenders in THIS bucket (this exact market + LTV/LLTV
-    ///         choice), never by lenders in other buckets or other markets -- the isolation
-    ///         property the whole design is built around.
-    function socializeBadDebt(address owner, bytes32 marketId, address loanAsset, uint16 ltvBps, uint16 lltvBps)
-        external
-        nonReentrant
-    {
-        (uint16 ltvTick, uint16 lltvTick) = BucketMath.validateAndTick(ltvBps, lltvBps);
-        bytes32 key = keccak256(abi.encode(marketId, loanAsset, ltvTick, lltvTick));
-        uint256 idxPlus1 = _drawIndex[owner][key];
-        if (idxPlus1 == 0) revert NoSuchDraw();
-        Draw storage d = _draws[owner][idxPlus1 - 1];
-        require(d.collateralAmount == 0 && d.borrowShares > 0, "not bad debt");
+    function socializeBadDebt(
+        address owner,
+        bytes32 marketId,
+        address loanAsset,
+        uint16 ltvBps,
+        uint16 lltvBps
+    ) external nonReentrant {
+        (uint16 ltvTick, uint16 lltvTick) =
+            BucketMath.validateAndTick(ltvBps, lltvBps);
 
-        bytes32 bKey = BucketMath.bucketKey(marketId, loanAsset, ltvTick, lltvTick);
+        bytes32 key =
+            keccak256(abi.encode(marketId, loanAsset, ltvTick, lltvTick));
+
+        uint256 idxPlus1 = _drawIndex[owner][key];
+
+        if (idxPlus1 == 0) revert NoSuchDraw();
+
+        Draw storage d = _draws[owner][idxPlus1 - 1];
+
+        require(
+            d.collateralAmount == 0 && d.borrowShares > 0,
+            "not bad debt"
+        );
+
+        bytes32 bKey =
+            BucketMath.bucketKey(marketId, loanAsset, ltvTick, lltvTick);
+
         _accrueBucket(bKey, loanAsset);
+
         Bucket storage b = buckets[bKey];
 
         uint256 debtAssets = d.borrowShares == b.totalBorrowShares
             ? b.totalBorrowAssets
-            : MathLib.toAssetsUp(d.borrowShares, b.totalBorrowAssets, b.totalBorrowShares);
+            : MathLib.toBorrowAssetsUp(
+                d.borrowShares,
+                b.totalBorrowAssets,
+                b.totalBorrowShares
+            );
+
         b.totalBorrowShares -= d.borrowShares;
         b.totalBorrowAssets -= debtAssets;
-        b.totalSupplyAssets = b.totalSupplyAssets > debtAssets ? b.totalSupplyAssets - debtAssets : 0;
+
+        b.totalSupplyAssets = b.totalSupplyAssets > debtAssets
+            ? b.totalSupplyAssets - debtAssets
+            : 0;
 
         _removeDraw(owner, key);
+
+        assert(
+            b.totalBorrowShares != 0 ||
+            b.totalBorrowAssets == 0
+        );
+
         emit BadDebtSocialized(owner, bKey, debtAssets);
     }
 
@@ -588,43 +987,86 @@ contract LendingPool is ReentrancyGuard {
     //                          INTERNAL
     // ============================================================
 
-    function _accrueBucket(bytes32 bKey, address loanAsset) internal {
+    function _accrueBucket(
+        bytes32 bKey,
+        address loanAsset
+    ) internal {
         Bucket storage b = buckets[bKey];
+
         uint256 last = b.lastAccrue;
+
         if (last == 0) {
             b.lastAccrue = block.timestamp;
             return;
         }
+
         uint256 elapsed = block.timestamp - last;
+
         if (elapsed == 0) return;
+
         b.lastAccrue = block.timestamp;
 
-        if (b.totalBorrowAssets == 0 || b.totalSupplyAssets == 0) return;
+        if (
+            b.totalBorrowAssets == 0 ||
+            b.totalSupplyAssets == 0
+        ) return;
 
-        ProtocolConfig.RateModelParams memory p = config.getRateModelParams(loanAsset);
-        uint256 util = InterestRateModel.utilizationWad(b.totalBorrowAssets, b.totalSupplyAssets);
-        uint256 rate = InterestRateModel.getBorrowRateWad(p, util);
-        uint256 growth = InterestRateModel.growthFactorWad(rate, elapsed);
+        ProtocolConfig.RateModelParams memory p =
+            config.getRateModelParams(loanAsset);
 
-        uint256 newBorrowAssets = MathLib.wadMul(b.totalBorrowAssets, growth);
-        uint256 interest = newBorrowAssets - b.totalBorrowAssets;
+        uint256 util = InterestRateModel.utilizationWad(
+            b.totalBorrowAssets,
+            b.totalSupplyAssets
+        );
+
+        uint256 rate =
+            InterestRateModel.getBorrowRateWad(p, util);
+
+        uint256 growth =
+            InterestRateModel.growthFactorWad(rate, elapsed);
+
+        uint256 newBorrowAssets =
+            MathLib.wadMul(b.totalBorrowAssets, growth);
+
+        uint256 interest =
+            newBorrowAssets - b.totalBorrowAssets;
 
         b.totalBorrowAssets = newBorrowAssets;
-        b.totalSupplyAssets += interest; // 100% of interest to suppliers; no protocol fee in v1
+        b.totalSupplyAssets += interest;
     }
 
-    function _activateTicks(address loanAsset, bytes32 marketId, uint16 ltvTick, uint16 lltvTick) internal {
-        bytes32 ladderKey = keccak256(abi.encode(loanAsset, marketId));
+    function _activateTicks(
+        address loanAsset,
+        bytes32 marketId,
+        uint16 ltvTick,
+        uint16 lltvTick
+    ) internal {
+        bytes32 ladderKey =
+            keccak256(abi.encode(loanAsset, marketId));
+
         ltvActiveBitmap[ladderKey] |= (uint256(1) << ltvTick);
-        bytes32 ltvKey = keccak256(abi.encode(loanAsset, marketId, ltvTick));
+
+        bytes32 ltvKey =
+            keccak256(abi.encode(loanAsset, marketId, ltvTick));
+
         lltvActiveBitmap[ltvKey] |= (uint256(1) << lltvTick);
     }
 
-    function _deactivateTicks(address loanAsset, bytes32 marketId, uint16 ltvTick, uint16 lltvTick) internal {
-        bytes32 ltvKey = keccak256(abi.encode(loanAsset, marketId, ltvTick));
+    function _deactivateTicks(
+        address loanAsset,
+        bytes32 marketId,
+        uint16 ltvTick,
+        uint16 lltvTick
+    ) internal {
+        bytes32 ltvKey =
+            keccak256(abi.encode(loanAsset, marketId, ltvTick));
+
         lltvActiveBitmap[ltvKey] &= ~(uint256(1) << lltvTick);
+
         if (lltvActiveBitmap[ltvKey] == 0) {
-            bytes32 ladderKey = keccak256(abi.encode(loanAsset, marketId));
+            bytes32 ladderKey =
+                keccak256(abi.encode(loanAsset, marketId));
+
             ltvActiveBitmap[ladderKey] &= ~(uint256(1) << ltvTick);
         }
     }
@@ -638,8 +1080,11 @@ contract LendingPool is ReentrancyGuard {
         uint256 addCollateral,
         uint256 addBorrowShares
     ) internal {
-        bytes32 key = keccak256(abi.encode(marketId, loanAsset, ltvTick, lltvTick));
+        bytes32 key =
+            keccak256(abi.encode(marketId, loanAsset, ltvTick, lltvTick));
+
         uint256 idxPlus1 = _drawIndex[owner][key];
+
         if (idxPlus1 == 0) {
             _draws[owner].push(
                 Draw({
@@ -652,107 +1097,202 @@ contract LendingPool is ReentrancyGuard {
                     breachTimestamp: 0
                 })
             );
+
             _drawIndex[owner][key] = _draws[owner].length;
         } else {
             Draw storage d = _draws[owner][idxPlus1 - 1];
+
             d.collateralAmount += addCollateral;
             d.borrowShares += addBorrowShares;
         }
     }
 
-    /// @dev Swap-pop removal; updates the moved draw's index pointer.
-    function _removeDraw(address owner, bytes32 key) internal {
+    function _removeDraw(
+        address owner,
+        bytes32 key
+    ) internal {
         uint256 idxPlus1 = _drawIndex[owner][key];
+
         uint256 lastIdx = _draws[owner].length - 1;
         uint256 idx = idxPlus1 - 1;
 
         if (idx != lastIdx) {
             Draw memory moved = _draws[owner][lastIdx];
+
             _draws[owner][idx] = moved;
-            bytes32 movedKey =
-                keccak256(abi.encode(moved.marketId, moved.loanAsset, moved.ltvTick, moved.lltvTick));
+
+            bytes32 movedKey = keccak256(
+                abi.encode(
+                    moved.marketId,
+                    moved.loanAsset,
+                    moved.ltvTick,
+                    moved.lltvTick
+                )
+            );
+
             _drawIndex[owner][movedKey] = idx + 1;
         }
+
         _draws[owner].pop();
+
         delete _drawIndex[owner][key];
     }
 
-    function _ltvBpsOf(uint256 collateralAmount, uint256 debtAssets, PriceCtx memory ctx)
-        internal
-        pure
-        returns (uint256)
-    {
-        if (collateralAmount == 0) return type(uint256).max;
-        uint256 collValue18 = Math.mulDiv(collateralAmount, ctx.collPrice18, 10 ** ctx.collDecimals);
-        if (collValue18 == 0) return type(uint256).max;
-        uint256 debtValue18 = Math.mulDiv(debtAssets, ctx.loanPrice18, 10 ** ctx.loanDecimals);
-        return Math.mulDiv(debtValue18, BucketMath.BPS_DENOMINATOR, collValue18);
+    function _ltvBpsOf(
+        uint256 collateralAmount,
+        uint256 debtAssets,
+        PriceCtx memory ctx
+    ) internal pure returns (uint256) {
+        if (collateralAmount == 0) {
+            return type(uint256).max;
+        }
+
+        uint256 collValue18 = Math.mulDiv(
+            collateralAmount,
+            ctx.collPrice18,
+            10 ** ctx.collDecimals
+        );
+
+        if (collValue18 == 0) {
+            return type(uint256).max;
+        }
+
+        uint256 debtValue18 = Math.mulDiv(
+            debtAssets,
+            ctx.loanPrice18,
+            10 ** ctx.loanDecimals
+        );
+
+        return Math.mulDiv(
+            debtValue18,
+            BucketMath.BPS_DENOMINATOR,
+            collValue18
+        );
     }
 
     // ============================================================
     //                            VIEWS
     // ============================================================
 
-    function getDraws(address owner) external view returns (Draw[] memory) {
+    function getDraws(
+        address owner
+    ) external view returns (Draw[] memory) {
         return _draws[owner];
     }
 
-    function getDraw(address owner, bytes32 marketId, address loanAsset, uint16 ltvTick, uint16 lltvTick)
-        external
-        view
-        returns (Draw memory)
-    {
-        bytes32 key = keccak256(abi.encode(marketId, loanAsset, ltvTick, lltvTick));
+    function getDraw(
+        address owner,
+        bytes32 marketId,
+        address loanAsset,
+        uint16 ltvTick,
+        uint16 lltvTick
+    ) external view returns (Draw memory) {
+        bytes32 key =
+            keccak256(abi.encode(marketId, loanAsset, ltvTick, lltvTick));
+
         uint256 idxPlus1 = _drawIndex[owner][key];
+
         if (idxPlus1 == 0) revert NoSuchDraw();
+
         return _draws[owner][idxPlus1 - 1];
     }
 
-    function previewDebt(bytes32 marketId, address loanAsset, uint16 ltvTick, uint16 lltvTick, address owner)
-        external
-        view
-        returns (uint256 debtAssets)
-    {
-        bytes32 key = keccak256(abi.encode(marketId, loanAsset, ltvTick, lltvTick));
+    function previewDebt(
+        bytes32 marketId,
+        address loanAsset,
+        uint16 ltvTick,
+        uint16 lltvTick,
+        address owner
+    ) external view returns (uint256 debtAssets) {
+        bytes32 key =
+            keccak256(abi.encode(marketId, loanAsset, ltvTick, lltvTick));
+
         uint256 idxPlus1 = _drawIndex[owner][key];
+
         if (idxPlus1 == 0) return 0;
+
         Draw storage d = _draws[owner][idxPlus1 - 1];
-        bytes32 bKey = BucketMath.bucketKey(marketId, loanAsset, ltvTick, lltvTick);
-        (uint256 simBorrowAssets, uint256 simBorrowShares) = _simulateAccrual(bKey, loanAsset);
-        debtAssets = MathLib.toAssetsUp(d.borrowShares, simBorrowAssets, simBorrowShares);
+
+        bytes32 bKey =
+            BucketMath.bucketKey(marketId, loanAsset, ltvTick, lltvTick);
+
+        (
+            uint256 simBorrowAssets,
+            uint256 simBorrowShares
+        ) = _simulateAccrual(bKey, loanAsset);
+
+        debtAssets = MathLib.toBorrowAssetsUp(
+            d.borrowShares,
+            simBorrowAssets,
+            simBorrowShares
+        );
     }
 
-    /// @dev Read-only projection of what `_accrueBucket` would do, without writing state.
-    ///      Lets views (and UIs) show live, up-to-the-second debt instead of a stale snapshot
-    ///      that only updates on the next actual interaction with the bucket.
-    function _simulateAccrual(bytes32 bKey, address loanAsset)
-        internal
-        view
-        returns (uint256 simBorrowAssets, uint256 simBorrowShares)
-    {
+    function _simulateAccrual(
+        bytes32 bKey,
+        address loanAsset
+    ) internal view returns (
+        uint256 simBorrowAssets,
+        uint256 simBorrowShares
+    ) {
         Bucket storage b = buckets[bKey];
+
         simBorrowAssets = b.totalBorrowAssets;
         simBorrowShares = b.totalBorrowShares;
 
         uint256 last = b.lastAccrue;
-        if (last == 0 || b.totalBorrowAssets == 0 || b.totalSupplyAssets == 0) return (simBorrowAssets, simBorrowShares);
-        uint256 elapsed = block.timestamp - last;
-        if (elapsed == 0) return (simBorrowAssets, simBorrowShares);
 
-        ProtocolConfig.RateModelParams memory p = config.getRateModelParams(loanAsset);
-        uint256 util = InterestRateModel.utilizationWad(b.totalBorrowAssets, b.totalSupplyAssets);
-        uint256 rate = InterestRateModel.getBorrowRateWad(p, util);
-        uint256 growth = InterestRateModel.growthFactorWad(rate, elapsed);
-        simBorrowAssets = MathLib.wadMul(b.totalBorrowAssets, growth);
-        // shares are unaffected by accrual; only the assets-per-share ratio changes
+        if (
+            last == 0 ||
+            b.totalBorrowAssets == 0 ||
+            b.totalSupplyAssets == 0
+        ) {
+            return (simBorrowAssets, simBorrowShares);
+        }
+
+        uint256 elapsed = block.timestamp - last;
+
+        if (elapsed == 0) {
+            return (simBorrowAssets, simBorrowShares);
+        }
+
+        ProtocolConfig.RateModelParams memory p =
+            config.getRateModelParams(loanAsset);
+
+        uint256 util = InterestRateModel.utilizationWad(
+            b.totalBorrowAssets,
+            b.totalSupplyAssets
+        );
+
+        uint256 rate =
+            InterestRateModel.getBorrowRateWad(p, util);
+
+        uint256 growth =
+            InterestRateModel.growthFactorWad(rate, elapsed);
+
+        simBorrowAssets =
+            MathLib.wadMul(b.totalBorrowAssets, growth);
     }
 
-    function bucketUtilizationWad(bytes32 marketId, address loanAsset, uint16 ltvTick, uint16 lltvTick)
-        external
-        view
-        returns (uint256)
-    {
-        Bucket storage b = buckets[BucketMath.bucketKey(marketId, loanAsset, ltvTick, lltvTick)];
-        return InterestRateModel.utilizationWad(b.totalBorrowAssets, b.totalSupplyAssets);
+    function bucketUtilizationWad(
+        bytes32 marketId,
+        address loanAsset,
+        uint16 ltvTick,
+        uint16 lltvTick
+    ) external view returns (uint256) {
+        Bucket storage b =
+            buckets[
+                BucketMath.bucketKey(
+                    marketId,
+                    loanAsset,
+                    ltvTick,
+                    lltvTick
+                )
+            ];
+
+        return InterestRateModel.utilizationWad(
+            b.totalBorrowAssets,
+            b.totalSupplyAssets
+        );
     }
 }
