@@ -28,6 +28,11 @@ contract LiquidationActions {
     uint256 public ghost_totalCollateralSeized;
     uint256 public ghost_totalBadDebtSocialized;
 
+    uint256 public socializationCalls;
+    uint256 public socializationEligibleDrawsFound;
+    uint256 public socializationSuccessful;
+    uint256 public socializationReverted;
+
     constructor(LendingPool _pool, Handler _baseHandler) {
         pool = _pool;
         baseHandler = _baseHandler;
@@ -113,36 +118,72 @@ contract LiquidationActions {
         } catch {}
     }
 
-    /// @notice Attempt bad-debt socialization on a randomly selected draw.
+    /// @notice Find an existing zero-collateral draw with debt and attempt
+    ///         bad-debt socialization.
     function socializeBadDebt(
         uint256 borrowerSeed,
         uint256 tickSeed
     ) external {
-        address borrower = _actor(borrowerSeed);
+        socializationCalls++;
 
-        (uint16 ltv, uint16 lltv) = _ticks(tickSeed);
+        uint256 actorCount = baseHandler.actorsLength();
+        uint256 startActor = borrowerSeed % actorCount;
 
-        LendingPool.Draw memory d = pool.getDraw(
-            borrower,
+        address selectedBorrower;
+        uint16 selectedLtv;
+        uint16 selectedLltv;
+
+        uint256 eligibleCount;
+        uint256 selection = tickSeed;
+
+        // Search all actors in a seed-dependent cyclic order.
+        for (uint256 offset; offset < actorCount; offset++) {
+            address borrower =
+                baseHandler.actors((startActor + offset) % actorCount);
+
+            LendingPool.Draw[] memory draws = pool.getDraws(borrower);
+
+            for (uint256 d; d < draws.length; d++) {
+                LendingPool.Draw memory draw = draws[d];
+
+                if (
+                    draw.marketId == baseHandler.wethMarketId()
+                        && draw.loanAsset == address(baseHandler.usdc())
+                        && draw.collateralAmount == 0
+                        && draw.borrowShares > 0
+                ) {
+                    // Deterministically select one eligible draw using
+                    // reservoir sampling.
+                    eligibleCount++;
+
+                    if (selection % eligibleCount == 0) {
+                        selectedBorrower = borrower;
+                        selectedLtv = draw.ltvTick;
+                        selectedLltv = draw.lltvTick;
+                    }
+                }
+            }
+        }
+
+        // No eligible draw exists: this is a skipped action, not a revert.
+        if (eligibleCount == 0) {
+            return;
+        }
+
+        socializationEligibleDrawsFound++;
+
+        // Keep the production function's eligibility checks unchanged.
+        try pool.socializeBadDebt(
+            selectedBorrower,
             baseHandler.wethMarketId(),
             address(baseHandler.usdc()),
-            ltv,
-            lltv
-        );
-
-        // Only attempt socialization for a draw that has no collateral
-        // and still has debt. The production function remains responsible
-        // for validating eligibility and accounting.
-        if (d.collateralAmount == 0 && d.borrowShares > 0) {
-            try pool.socializeBadDebt(
-                borrower,
-                baseHandler.wethMarketId(),
-                address(baseHandler.usdc()),
-                ltv * 100,
-                lltv * 100
-            ) {
-                ghost_totalBadDebtSocialized++;
-            } catch {}
+            selectedLtv * 100,
+            selectedLltv * 100
+        ) {
+            ghost_totalBadDebtSocialized++;
+            socializationSuccessful++;
+        } catch {
+            socializationReverted++;
         }
     }
 
@@ -497,5 +538,29 @@ contract LiquidationInvariantTest is StdInvariant, TestBase {
             + liquidationActions.ghost_totalCollateralSeized();
 
         assertEq(accountedCollateral, netDeposited, "collateral conservation failure");
+    }
+
+    function invariant_badDebtSocializationCountersReconcile()
+        public
+        view
+    {
+        assertEq(
+            liquidationActions.ghost_totalBadDebtSocialized(),
+            liquidationActions.socializationSuccessful(),
+            "socialization success counters diverged"
+        );
+
+        assertLe(
+            liquidationActions.socializationSuccessful()
+                + liquidationActions.socializationReverted(),
+            liquidationActions.socializationEligibleDrawsFound(),
+            "socialization outcomes exceed eligible attempts"
+        );
+
+        assertLe(
+            liquidationActions.socializationEligibleDrawsFound(),
+            liquidationActions.socializationCalls(),
+            "eligible socializations exceed calls"
+        );
     }
 }

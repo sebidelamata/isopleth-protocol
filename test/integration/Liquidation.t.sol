@@ -200,4 +200,137 @@ contract LiquidationTest is TestBase {
             freeBefore + beforeDraw.collateralAmount - seized
         );
     }
+
+    function test_socializeBadDebt_removesResidualDebtAndWritesDownBucket()
+        public
+    {
+        uint16 ltvBps = 7500;
+        uint16 lltvBps = 8300;
+
+        bytes32 bucketKey = BucketMath.bucketKey(
+            wethMarketId,
+            address(usdc),
+            75,
+            83
+        );
+
+        // setUp() already:
+        // - Funds and approves lender, borrower, and liquidator.
+        // - Supplies 100,000 USDC into the 75/83 bucket.
+        // - Deposits 10 WETH as collateral.
+        // - Borrows 22,000 USDC.
+
+        (
+            ,
+            ,
+            uint256 borrowAssetsBefore,
+            uint256 borrowSharesBefore,
+
+        ) = pool.buckets(bucketKey);
+
+        assertGt(borrowAssetsBefore, 0);
+        assertGt(borrowSharesBefore, 0);
+
+        // Crash collateral price sufficiently to create bad debt.
+        wethOracle.setPrice(500e18);
+
+        // Allow the liquidation bonus to reach its maximum.
+        vm.warp(block.timestamp + 30 minutes);
+
+        // Liquidate using the existing liquidator.
+        vm.prank(liquidator);
+        pool.liquidate(
+            borrower,
+            wethMarketId,
+            address(usdc),
+            ltvBps,
+            lltvBps,
+            10_000e6
+        );
+
+        // The liquidator should exhaust collateral while leaving
+        // residual borrow shares outstanding.
+        LendingPool.Draw memory badDebtDraw = pool.getDraw(
+            borrower,
+            wethMarketId,
+            address(usdc),
+            75,
+            83
+        );
+
+        assertEq(badDebtDraw.collateralAmount, 0);
+        assertGt(badDebtDraw.borrowShares, 0);
+
+        (
+            ,
+            ,
+            uint256 borrowAssetsAfterLiquidation,
+            uint256 borrowSharesAfterLiquidation,
+
+        ) = pool.buckets(bucketKey);
+
+        assertGt(borrowAssetsAfterLiquidation, 0);
+        assertGt(borrowSharesAfterLiquidation, 0);
+
+        assertLt(
+            borrowAssetsAfterLiquidation,
+            borrowAssetsBefore
+        );
+
+        // Anyone can socialize the residual bad debt.
+        address socializer = makeAddr("socializer");
+
+        vm.prank(socializer);
+        pool.socializeBadDebt(
+            borrower,
+            wethMarketId,
+            address(usdc),
+            ltvBps,
+            lltvBps
+        );
+
+        // The draw must be removed.
+        vm.expectRevert(LendingPool.NoSuchDraw.selector);
+        pool.getDraw(
+            borrower,
+            wethMarketId,
+            address(usdc),
+            75,
+            83
+        );
+
+        // This bucket contains no other borrowers, so all residual
+        // borrow assets and shares should be cleared.
+        (
+            ,
+            ,
+            uint256 borrowAssetsAfterSocialization,
+            uint256 borrowSharesAfterSocialization,
+
+        ) = pool.buckets(bucketKey);
+
+        assertEq(
+            borrowAssetsAfterSocialization,
+            0,
+            "residual borrow assets were not cleared"
+        );
+
+        assertEq(
+            borrowSharesAfterSocialization,
+            0,
+            "residual borrow shares were not cleared"
+        );
+
+        assertGt(
+            borrowAssetsBefore,
+            borrowAssetsAfterLiquidation,
+            "liquidation did not reduce debt"
+        );
+
+        assertGt(
+            borrowSharesBefore,
+            borrowSharesAfterLiquidation,
+            "liquidation did not reduce borrow shares"
+        );
+    }
 }
